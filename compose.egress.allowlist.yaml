@@ -1,0 +1,57 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  sandbox-egress:
+    build:
+      context: .
+      dockerfile: docker/egress/Dockerfile
+    image: agent-paladin/egress:6
+    user: "squid"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=32m
+      - /run:rw,nosuid,nodev,size=8m
+    volumes:
+      - ./docker/egress/squid.conf:/etc/squid/squid.conf:ro
+      - ./.agent/generated/sandbox-allow.txt:/etc/squid/allow.txt:ro
+      - ./config/egress/provider-deny.txt:/etc/squid/block.txt:ro
+    networks:
+      sandbox_net:
+        ipv4_address: 172.31.240.4
+      public_net: {}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -w 2 127.0.0.1 24128 </dev/null"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 256
+    logging: *default-logging
+
+  sandbox:
+    environment:
+      HTTP_PROXY: http://sandbox-egress:24128
+      HTTPS_PROXY: http://sandbox-egress:24128
+      ALL_PROXY: http://sandbox-egress:24128
+      http_proxy: http://sandbox-egress:24128
+      https_proxy: http://sandbox-egress:24128
+      all_proxy: http://sandbox-egress:24128
+      NO_PROXY: localhost,127.0.0.1,::1,llm-gateway,sandbox-egress
+      no_proxy: localhost,127.0.0.1,::1,llm-gateway,sandbox-egress
+    depends_on:
+      sandbox-egress:
+        condition: service_healthy
+
+  sandbox-firewall:
+    environment:
+      EGRESS_PROXY_ENABLED: "1"

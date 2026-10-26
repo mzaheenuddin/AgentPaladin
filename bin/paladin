@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Agent Paladin - Defense-in-depth guardian for autonomous coding agents."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+COMMANDS = {
+    "agent": "bin/agent",
+    "run": "bin/agent",
+    "shell": "bin/shell",
+    "init": ("bin/secrets", "init"),
+    "secrets": "bin/secrets",
+    "preflight": "bin/preflight",
+    "build": "bin/build",
+    "reload": "bin/reload",
+    "verify": "bin/verify",
+    "export": "bin/export",
+    "audit": "bin/audit",
+    "scan": "bin/scan",
+    "models": "bin/models",
+    "ollama": "bin/ollama",
+    "down": "bin/down",
+    "logs": "bin/logs",
+    "clean": "bin/clean",
+    "egress": "bin/egress",
+    "approve": "bin/egress-approve",
+    "deny": "bin/egress-deny",
+    "pending": "bin/egress-pending",
+}
+
+HELP = """Agent Paladin — The sworn guardian for autonomous AI coding agents.
+
+Usage:
+  paladin [command] [options]
+  paladin [options to pass directly to agent]
+
+Commands:
+  run / agent     Start a secured agent session (default)
+  shell           Open an interactive shell in the secured sandbox
+  init            Initialize generated gateway & master secrets
+  secrets         List or set provider API keys
+  preflight       Verify host and Docker isolation posture
+  build           Build all hardened container images
+  reload          Recreate proxy & gateway services after config change
+  verify          Execute full security verification suite
+  export          Generate and review a cleansed patch from snapshot
+  audit           Audit direct-mount project modifications
+  scan            Scan project files for secret patterns
+  models          List and render configured models
+  ollama          Manage local Ollama model runtime
+  logs            Stream container logs
+  down            Stop running Agent Paladin services
+  clean           Remove old run state directories
+  pending         List API egress requests awaiting approval
+  approve <id>    Approve an egress broker request
+  deny <id>       Deny an egress broker request
+  install-cli [-f] Symlink 'paladin' to ~/.local/bin for global terminal access
+
+Run 'paladin --help' or check 'docs/GUIDE.md' for more details.
+"""
+
+
+def install_cli(force: bool = False) -> int:
+    target_dir = Path.home() / ".local" / "bin"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    symlink_path = target_dir / "paladin"
+    source = ROOT / "bin" / "paladin"
+    if symlink_path.is_symlink():
+        try:
+            if not force and symlink_path.resolve() != source.resolve():
+                print(
+                    f"error: {symlink_path} already points to {symlink_path.resolve()}; "
+                    "remove it manually or use --force if that is intentional",
+                    file=sys.stderr,
+                )
+                return 1
+        except OSError:
+            pass
+        symlink_path.unlink()
+    elif symlink_path.exists():
+        if not force:
+            print(
+                f"error: {symlink_path} exists and is not a symlink; refusing to overwrite it (use --force to overwrite)",
+                file=sys.stderr,
+            )
+            return 1
+        symlink_path.unlink()
+    symlink_path.symlink_to(source)
+    print(f"Successfully installed 'paladin' to {symlink_path}")
+    path_env = os.environ.get("PATH", "")
+    if str(target_dir) not in path_env:
+        print("\nNote: Make sure ~/.local/bin is in your PATH. Add this to your shell config (~/.zshrc or ~/.bashrc):")
+        print('  export PATH="$HOME/.local/bin:$PATH"\n')
+    print("Now you can run 'paladin' from any project directory on your machine!")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        return subprocess.run([str(ROOT / "bin" / "agent")], check=False).returncode
+
+    if argv[0] in {"-h", "--help", "help"}:
+        print(HELP)
+        return 0
+
+    sub = argv[0].lower()
+    if sub in {"install-cli", "install"}:
+        force = any(arg in argv[1:] for arg in ("-f", "--force"))
+        return install_cli(force=force)
+
+    if sub in COMMANDS:
+        target = COMMANDS[sub]
+        if isinstance(target, tuple):
+            cmd = [str(ROOT / target[0]), *target[1:], *argv[1:]]
+        else:
+            cmd = [str(ROOT / target), *argv[1:]]
+        return subprocess.run(cmd, check=False).returncode
+
+    # If the first argument is an option like --profile, forward directly to bin/agent
+    return subprocess.run([str(ROOT / "bin" / "agent"), *argv], check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+

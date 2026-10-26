@@ -1,0 +1,25 @@
+{
+  "approvable_domains": [],
+  "approval_required": true,
+  "approval_timeout_seconds": 300,
+  "max_request_bytes": 1048576,
+  "max_response_bytes": 5242880,
+  "max_pending_requests": 64,
+  "request_timeout_seconds": 30,
+  "credentials": {},
+  "allowed_request_headers": ["accept", "content-type", "user-agent"],
+  "blocked_request_headers": [
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token"
+  ],
+  "notes": [
+    "Add only the API hosts you actually intend to call.",
+    "Never put raw credentials in this file; use secret_file references.",
+    "Example credential entry:",
+    "  \"api.github.com\": {\"secret_file\": \"/run/secrets/github_token\", \"header\": \"Authorization\", \"prefix\": \"Bearer \"}"
+  ]
+}

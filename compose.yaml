@@ -1,0 +1,382 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardening: &default-hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  logging: *default-logging
+
+services:
+  llm-gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway/Dockerfile
+    image: agent-paladin/gateway:2.10
+    user: "1000:1000"
+    <<: *default-hardening
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
+    secrets:
+      - gateway_token
+      - litellm_master_key
+    networks:
+      sandbox_net:
+        ipv4_address: 172.31.240.2
+      control_net: {}
+    depends_on:
+      prompt-dlp:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:24080/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 256
+
+  prompt-dlp:
+    build:
+      context: .
+      dockerfile: docker/prompt-dlp/Dockerfile
+    image: agent-paladin/prompt-dlp:1
+    user: "10001:10001"
+    <<: *default-hardening
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
+    environment:
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "24081"
+      UPSTREAM_URL: http://llm-proxy:24000
+      DLP_ACTION: ${DLP_ACTION:-block}
+      MAX_BODY_BYTES: "33554432"
+    networks:
+      control_net: {}
+    depends_on:
+      llm-proxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:24081/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 256
+
+  llm-proxy:
+    build:
+      context: .
+      dockerfile: docker/litellm/Dockerfile
+    image: agent-paladin/litellm:1.98.0
+    user: "101:101"
+    <<: *default-hardening
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m
+    secrets:
+      - litellm_master_key
+      - deepseek_api_key
+      - anthropic_api_key
+      - openai_api_key
+    environment:
+      HOME: /tmp
+      USER: litellm
+      LOGNAME: litellm
+      LITELLM_NON_ROOT: "true"
+      LITELLM_MODE: PRODUCTION
+      LITELLM_LOG: INFO
+      LITELLM_TELEMETRY: "False"
+      DISABLE_ADMIN_UI: "True"
+      NO_DOCS: "True"
+      NO_REDOC: "True"
+      NO_OPENAPI: "True"
+      XDG_CACHE_HOME: /tmp/litellm/cache
+      PRISMA_BINARY_CACHE_DIR: /tmp/litellm/prisma
+      LITELLM_MIGRATION_DIR: /tmp/litellm/migrations
+      LITELLM_UI_PATH: /tmp/litellm/ui
+      LITELLM_ASSETS_PATH: /tmp/litellm/assets
+      HTTP_PROXY: http://llm-egress:24128
+      HTTPS_PROXY: http://llm-egress:24128
+      NO_PROXY: localhost,127.0.0.1,llm-proxy,ollama
+      no_proxy: localhost,127.0.0.1,llm-proxy,ollama
+    volumes:
+      - ./.agent/generated/litellm.json:/etc/litellm/config.json:ro
+    networks:
+      control_net: {}
+      egress_net: {}
+      inference_net: {}
+    depends_on:
+      llm-egress:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:24000/health/liveliness', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 30
+      start_period: 20s
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 512
+
+  llm-egress:
+    build:
+      context: .
+      dockerfile: docker/egress/Dockerfile
+    image: agent-paladin/egress:6
+    user: "squid"
+    <<: *default-hardening
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=32m
+      - /run:rw,nosuid,nodev,size=8m
+    volumes:
+      - ./docker/egress/squid.conf:/etc/squid/squid.conf:ro
+      - ./config/egress/provider-allow.txt:/etc/squid/allow.txt:ro
+      - ./config/egress/block-none.txt:/etc/squid/block.txt:ro
+    networks:
+      egress_net: {}
+      public_net: {}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -w 2 127.0.0.1 24128 </dev/null"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 256
+
+  sandbox-netns:
+    image: alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
+    command: ["sleep", "infinity"]
+    user: "65534:65534"
+    <<: *default-hardening
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=8m
+    networks:
+      sandbox_net:
+        ipv4_address: 172.31.240.3
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 1s
+
+  sandbox-firewall:
+    build:
+      context: .
+      dockerfile: docker/firewall/Dockerfile
+    image: agent-paladin/firewall:1
+    network_mode: "service:sandbox-netns"
+    user: "0:0"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=8m
+      - /run:rw,nosuid,nodev,size=8m
+    environment:
+      GATEWAY_IP: 172.31.240.2
+      GATEWAY_PORT: "24080"
+      EGRESS_PROXY_ENABLED: "0"
+      EGRESS_PROXY_IP: 172.31.240.4
+      EGRESS_PROXY_PORT: "24128"
+      BROKER_ENABLED: "0"
+      BROKER_IP: 172.31.240.5
+      BROKER_PORT: "24443"
+    depends_on:
+      sandbox-netns:
+        condition: service_started
+    restart: "no"
+    logging: *default-logging
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: docker/agent/Dockerfile
+      args:
+        AGENT_UID: ${AGENT_UID:-1000}
+        AGENT_GID: ${AGENT_GID:-1000}
+    image: agent-paladin/agent:2.1.4-${AGENT_UID:-1000}-${AGENT_GID:-1000}
+    user: "${AGENT_UID:-1000}:${AGENT_GID:-1000}"
+    runtime: ${SANDBOX_RUNTIME:-runc}
+    <<: *default-hardening
+    network_mode: "service:sandbox-netns"
+    init: true
+    stdin_open: true
+    tty: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m
+      - /run:rw,noexec,nosuid,nodev,size=16m
+    volumes:
+      - ${SANDBOX_HOME_DIR:?SANDBOX_HOME_DIR is required}:/home/agent
+      - ./config/opencode/AGENTS.md:/etc/opencode/AGENTS.md:ro
+      - ./config/git:/etc/git:ro
+      - ./.agent/generated/opencode.json:/etc/opencode/opencode.json:ro
+    secrets:
+      - gateway_token
+    environment:
+      HOME: /home/agent
+      XDG_CONFIG_HOME: /home/agent/.config
+      XDG_DATA_HOME: /home/agent/.local/share
+      XDG_STATE_HOME: /home/agent/.local/state
+      XDG_CACHE_HOME: /home/agent/.cache
+      TMPDIR: /tmp
+      OPENCODE_DISABLE_FREE_MODELS: "1"
+      SANDBOX_WORKSPACE_MODE: ${SANDBOX_WORKSPACE_MODE:-snapshot}
+      SANDBOX_EGRESS_MODE: ${SANDBOX_EGRESS_MODE:-deny}
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_GLOBAL: /etc/git/gitconfig
+      GIT_CONFIG_COUNT: "2"
+      GIT_CONFIG_KEY_0: core.hooksPath
+      GIT_CONFIG_VALUE_0: /etc/git/empty-hooks
+      GIT_CONFIG_KEY_1: core.fsmonitor
+      GIT_CONFIG_VALUE_1: "false"
+      GIT_PAGER: cat
+      GIT_EDITOR: "true"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_ASKPASS: /bin/false
+      NO_PROXY: localhost,127.0.0.1,::1,llm-gateway
+      no_proxy: localhost,127.0.0.1,::1,llm-gateway
+    pids_limit: 1024
+    mem_limit: 4g
+    cpus: 2
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+      core: 0
+    logging: *default-logging
+    depends_on:
+      sandbox-netns:
+        condition: service_started
+      sandbox-firewall:
+        condition: service_completed_successfully
+      llm-gateway:
+        condition: service_healthy
+
+  # Optional local-model runtime. Enable with the "ollama" profile and pull a
+  # model through the dedicated model-registry proxy below. The sandbox can
+  # never reach this service directly; only LiteLLM is on inference_net.
+  ollama:
+    image: ollama/ollama@sha256:4c5b27871a3239a717048f9b93057680a51b60c8119a7016aebb57f938e25e35
+    profiles: ["ollama"]
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m
+      - /root/.cache:rw,nosuid,nodev,size=128m
+    environment:
+      HOME: /root
+      HTTP_PROXY: http://ollama-egress:24128
+      HTTPS_PROXY: http://ollama-egress:24128
+      NO_PROXY: localhost,127.0.0.1,::1,ollama,llm-proxy
+      http_proxy: http://ollama-egress:24128
+      https_proxy: http://ollama-egress:24128
+      no_proxy: localhost,127.0.0.1,::1,ollama,llm-proxy
+    networks:
+      inference_net: {}
+    volumes:
+      - ollama_data:/root/.ollama
+    depends_on:
+      ollama-egress:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    pids_limit: 512
+    logging: *default-logging
+
+  # Narrow egress proxy for model downloads (Ollama registry/CDN only).
+  ollama-egress:
+    build:
+      context: .
+      dockerfile: docker/egress/Dockerfile
+    image: agent-paladin/egress:6
+    profiles: ["ollama"]
+    user: "squid"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=32m
+      - /run:rw,nosuid,nodev,size=8m
+    volumes:
+      - ./docker/egress/squid.conf:/etc/squid/squid.conf:ro
+      - ./config/egress/ollama-allow.txt:/etc/squid/allow.txt:ro
+      - ./config/egress/block-none.txt:/etc/squid/block.txt:ro
+    networks:
+      inference_net: {}
+      public_net: {}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -w 2 127.0.0.1 24128 </dev/null"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 256
+    logging: *default-logging
+
+networks:
+  sandbox_net:
+    internal: true
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 172.31.240.0/24
+  control_net:
+    internal: true
+    enable_ipv6: false
+  egress_net:
+    internal: true
+    enable_ipv6: false
+  inference_net:
+    internal: true
+    enable_ipv6: false
+  public_net:
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      # Egress proxies and the broker share this network only to reach the
+      # internet. They must not be able to pivot into each other.
+      com.docker.network.bridge.enable_icc: "false"
+
+secrets:
+  gateway_token:
+    file: ./secrets/GATEWAY_TOKEN
+  litellm_master_key:
+    file: ./secrets/LITELLM_MASTER_KEY
+  deepseek_api_key:
+    file: ./secrets/DEEPSEEK_API_KEY
+  anthropic_api_key:
+    file: ./secrets/ANTHROPIC_API_KEY
+  openai_api_key:
+    file: ./secrets/OPENAI_API_KEY
+  github_token:
+    file: ./secrets/broker/GITHUB_TOKEN
+
+volumes:
+  ollama_data:

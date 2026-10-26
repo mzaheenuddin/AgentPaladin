@@ -1,0 +1,33 @@
+{
+	admin off
+	auto_https off
+}
+
+:24080 {
+	@health path /health
+	respond @health 200
+
+	@allowed {
+		path /v1/chat/completions /v1/messages /v1/responses /v1/models /v1/embeddings
+		header Authorization "Bearer {$GATEWAY_TOKEN}"
+	}
+
+	handle @allowed {
+		reverse_proxy prompt-dlp:24081 {
+			header_up Authorization "Bearer {$LITELLM_MASTER_KEY}"
+			header_up Host prompt-dlp:24081
+			header_up -Cookie
+			header_up -Proxy-Authorization
+			header_up -X-Api-Key
+			header_up -X-Auth-Token
+			header_up -X-Csrf-Token
+			header_up -Forwarded
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			header_up -X-Real-IP
+		}
+	}
+
+	respond 401
+}

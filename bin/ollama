@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Manage the optional Ollama service used by the local profile.
+
+Examples:
+    bin/ollama list
+    bin/ollama pull qwen3-coder
+
+Ollama lives on the internal inference network and is reachable only by the
+LiteLLM proxy. The sandbox never talks to it directly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import compose_command, config, ensure_dir, fail  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="ollama command (default: list), e.g. pull qwen3-coder",
+    )
+    args = parser.parse_args(argv)
+    command_args = args.command or ["list"]
+
+    cfg = config()
+    project = cfg.get("COMPOSE_PROJECT_NAME", "agent-paladin")
+    home = ensure_dir(Path(cfg["STATE_DIR"]) / "runtime-home", 0o700)
+    files = [ROOT / "compose.yaml"]
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPOSE_PROJECT_NAME": project,
+            "AGENT_UID": str(os.getuid()),
+            "AGENT_GID": str(os.getgid()),
+            "SANDBOX_HOME_DIR": str(home),
+            "SANDBOX_WORKSPACE_MODE": "snapshot",
+            "SANDBOX_EGRESS_MODE": cfg.get("SANDBOX_EGRESS", "deny"),
+            "SANDBOX_RUNTIME": cfg.get("SANDBOX_RUNTIME", "runc"),
+        }
+    )
+
+    up = compose_command(files, project_name=project)
+    up.extend(
+        [
+            "--profile",
+            "ollama",
+            "up",
+            "-d",
+            "--wait",
+            "ollama-egress",
+            "ollama",
+        ]
+    )
+    print("starting ollama and its registry proxy...")
+    started = subprocess.run(up, env=env, check=False)
+    if started.returncode != 0:
+        fail("could not start ollama")
+
+    exec_command = compose_command(files, project_name=project)
+    exec_command.extend(["--profile", "ollama", "exec", "-T", "ollama", "ollama", *command_args])
+    return subprocess.run(exec_command, env=env, check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1056 @@
+#!/usr/bin/env python3
+"""Launch a hardened Agent Paladin sandbox run."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import (  # noqa: E402
+    compose_command,
+    compose_files,
+    config,
+    ensure_dir,
+    fail,
+    generated_dir,
+    project_slug,
+    workspace_override_path,
+)
+
+PROFILE_DEFAULTS = {
+    "edit": {"workspace": "snapshot", "egress": "deny"},
+    "install": {"workspace": "snapshot", "egress": "allowlist"},
+    "api": {"workspace": "snapshot", "egress": "broker"},
+    "confidential": {"workspace": "snapshot", "egress": "deny"},
+    "local": {"workspace": "snapshot", "egress": "deny"},
+}
+
+# Credential stores are replaced with empty directories/files in direct modes.
+# Read-only is not enough for data that must never enter the sandbox at all.
+MASKED_DIRS = {
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".agent",
+    "secrets",
+    ".gitconfig",
+    ".bash_history",
+    ".zsh_history",
+    ".python_history",
+    ".lesshst",
+}
+SENSITIVE_FILE_NAMES = {
+    ".env",
+    ".envrc",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".git-credentials",
+    ".gitconfig",
+    ".bash_history",
+    ".zsh_history",
+    ".python_history",
+    "credentials.json",
+    "opencode.json",
+    "opencode.jsonc",
+    "agents.md",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+SENSITIVE_FILE_PATTERNS = (
+    ".env.*",
+    "service-account*.json",
+    "terraform.tfstate*",
+    "terraform.tfvars*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.kdbx",
+    "*.jks",
+    "*.keystore",
+)
+MASKED_FILE_PATTERNS = ("*.p12", "*.pfx", "*.kdbx", "*.jks", "*.keystore")
+CONFIG_FILE_NAMES = {"opencode.json", "opencode.jsonc", "agents.md", ".opencode"}
+ALLOWED_ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
+WALK_SKIP_NAMES = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    ".next",
+    ".nuxt",
+    ".cache",
+    "coverage",
+    "vendor",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".idea",
+}
+SYSTEM_DIRS = {
+    Path("/"),
+    Path("/etc"),
+    Path("/usr"),
+    Path("/var"),
+    Path("/proc"),
+    Path("/sys"),
+    Path("/dev"),
+    Path("/run"),
+    Path("/boot"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/lib"),
+    Path("/lib64"),
+    # macOS resolves several of these through /private.
+    Path("/private/etc"),
+    Path("/private/var"),
+    Path("/System"),
+    Path("/Library"),
+}
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def make_run_id() -> str:
+    return (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + f"-{os.getpid()}-{os.urandom(3).hex()}"
+    )
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def ensure_secrets() -> None:
+    # Always run init: it creates missing files, tightens modes, and validates
+    # existing generated tokens before they are consumed by Caddy or LiteLLM.
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "secrets"), "init"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        fail("could not initialize or validate secrets")
+
+
+def split_domains(values: list[str]) -> list[str]:
+    domains: list[str] = []
+    for value in values:
+        for item in value.replace("\n", ",").split(","):
+            item = item.strip().lower()
+            if item:
+                domains.append(item)
+    return domains
+
+
+_HOSTNAME_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def _normalize_domain(domain: str) -> str:
+    domain = domain.strip().lower().rstrip(".")
+    if "://" in domain or "/" in domain or ":" in domain or "*" in domain:
+        fail(f"invalid allowlist domain (use a hostname, not a URL): {domain}")
+    if domain.startswith("."):
+        suffix = True
+        bare = domain[1:]
+    else:
+        suffix = False
+        bare = domain
+    if not bare or len(bare) > 253 or "." not in bare:
+        fail(f"invalid allowlist domain (use a fully-qualified hostname): {domain}")
+    if bare in {"localhost", "local", "internal"} or bare.endswith(
+        (".local", ".internal", ".localhost")
+    ):
+        fail(f"refusing local/internal allowlist domain: {domain}")
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(bare)
+        fail(f"IP addresses are not allowed in the sandbox allowlist: {domain}")
+    except ValueError:
+        pass
+    for label in bare.split("."):
+        if not _HOSTNAME_LABEL.fullmatch(label):
+            fail(f"invalid allowlist hostname: {domain}")
+    return ("." if suffix else "") + bare
+
+
+def validate_domains(domains: list[str]) -> list[str]:
+    allowed: list[str] = []
+    blocked_provider = set()
+    provider_file = ROOT / "config" / "egress" / "provider-deny.txt"
+    if provider_file.exists():
+        for line in provider_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip().lower()
+            if line and not line.startswith("#"):
+                blocked_provider.add(line.lstrip("."))
+    for raw_domain in domains:
+        domain = _normalize_domain(raw_domain)
+        bare = domain.lstrip(".")
+        if any(bare == blocked or bare.endswith("." + blocked) for blocked in blocked_provider):
+            fail(f"provider API domain must go through the LLM gateway, not sandbox egress: {domain}")
+
+        # Squid rejects an ACL that contains both a domain and its subdomain
+        # (for example ".example.com" and "api.example.com"). Suffix entries
+        # (leading dot) cover all subdomains and can safely absorb narrower
+        # entries. Ambiguous exact parent/child pairs are rejected instead of
+        # silently dropping the narrower hostname.
+        suffix = domain.startswith(".")
+        covered = False
+        kept: list[str] = []
+        for existing in allowed:
+            existing_bare = existing.lstrip(".")
+            existing_suffix = existing.startswith(".")
+            if existing_suffix and (
+                bare == existing_bare or bare.endswith("." + existing_bare)
+            ):
+                covered = True
+                kept.append(existing)
+                continue
+            if not existing_suffix and bare == existing_bare:
+                if suffix:
+                    # The new leading-dot entry is broader; replace the exact one.
+                    continue
+                covered = True
+                kept.append(existing)
+                continue
+            if suffix and (existing_bare == bare or existing_bare.endswith("." + bare)):
+                # The new suffix entry covers this existing entry.
+                continue
+            if not existing_suffix and not suffix and (
+                existing_bare.endswith("." + bare) or bare.endswith("." + existing_bare)
+            ):
+                fail(
+                    "overlapping exact allowlist domains; use a broader leading-dot "
+                    f"entry (for example .{bare if existing_bare.endswith('.' + bare) else existing_bare}): "
+                    f"{existing} and {domain}"
+                )
+            if not suffix and existing_suffix and existing_bare.endswith("." + bare):
+                fail(
+                    "overlapping exact allowlist domain; use a broader leading-dot "
+                    f"entry (for example .{bare}): {existing} and {domain}"
+                )
+            if suffix and not existing_suffix and (
+                bare == existing_bare or bare.endswith("." + existing_bare)
+            ):
+                fail(
+                    "overlapping exact allowlist domain; use a broader leading-dot "
+                    f"entry (for example .{existing_bare}): {existing} and {domain}"
+                )
+            kept.append(existing)
+        allowed = kept
+        if not covered:
+            allowed.append(domain)
+    return allowed
+
+
+def latest_images() -> dict[str, str]:
+    result: dict[str, str] = {}
+    for name, image in {
+        "agent": f"agent-paladin/agent:2.1.4-{os.getuid()}-{os.getgid()}",
+        "gateway": "agent-paladin/gateway:2.10",
+        "prompt_dlp": "agent-paladin/prompt-dlp:1",
+        "litellm": "agent-paladin/litellm:1.98.0",
+        "egress": "agent-paladin/egress:6",
+        "broker": "agent-paladin/egress-broker:1",
+        "firewall": "agent-paladin/firewall:1",
+    }.items():
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if inspect.returncode == 0:
+            result[name] = inspect.stdout.strip()
+    return result
+
+
+def yaml_quote(value: str | Path) -> str:
+    # Compose performs ${VAR} interpolation in YAML values even when quoted.
+    # Escape dollar signs so a project/state path containing them is mounted
+    # literally instead of being expanded by Compose.
+    return json.dumps(str(value)).replace("$", "$$")
+
+
+def add_volume(
+    lines: list[str],
+    source: Path,
+    target: str,
+    *,
+    read_only: bool,
+) -> None:
+    lines.extend(
+        [
+            "      - type: bind",
+            f"        source: {yaml_quote(source)}",
+            f"        target: {yaml_quote(target)}",
+            f"        read_only: {'true' if read_only else 'false'}",
+        ]
+    )
+
+
+def validate_project_path(project: Path, cfg: dict[str, str], mode: str) -> None:
+    state_dir = Path(cfg["STATE_DIR"]).resolve()
+    for system_dir in SYSTEM_DIRS:
+        if system_dir == Path("/"):
+            continue
+        if project == system_dir or system_dir in project.parents:
+            fail(f"refusing to use a system directory as the project: {project}")
+    if project == Path.home().resolve():
+        fail("refusing to use the home directory as the project; choose a repository")
+    if state_dir == project or state_dir.is_relative_to(project):
+        fail(
+            "the project directory contains Agent Paladin state; "
+            "choose a project directory outside STATE_DIR"
+        )
+    if project.is_relative_to(state_dir):
+        fail("the project directory is inside Agent Paladin state; choose the real repository")
+    if project == ROOT:
+        if mode != "snapshot":
+            fail(
+                "refusing direct mode on the Paladin installation; "
+                "use snapshot mode and review the export"
+            )
+        print(
+            "warning: running on the Paladin installation in snapshot mode; "
+            "secrets/ and state are excluded",
+            file=sys.stderr,
+        )
+
+
+def _sensitive_file(name: str) -> bool:
+    lowered = name.casefold()
+    if lowered in ALLOWED_ENV_TEMPLATES:
+        return False
+    if lowered in SENSITIVE_FILE_NAMES:
+        return True
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in SENSITIVE_FILE_PATTERNS)
+
+
+def _masked_file(name: str) -> bool:
+    lowered = name.casefold()
+    return lowered in MASKED_DIRS or any(
+        fnmatch.fnmatchcase(lowered, pattern) for pattern in MASKED_FILE_PATTERNS
+    )
+
+
+def _iter_sensitive_paths(project: Path, *, allow_secrets: bool = False):
+    """Yield (relative, is_dir, masked) for data that must not be writable.
+
+    Masked paths are replaced with an empty directory/file in the container, so
+    credential stores are not readable at all. Other protected paths are
+    mounted read-only. Credential files are masked by default; an explicit
+    ``--allow-secrets`` makes them visible read-only after the operator accepts
+    the direct-mode risk.
+    """
+    for current, dirnames, filenames in os.walk(project, followlinks=False):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(project)
+        for directory in list(dirnames):
+            lowered = directory.casefold()
+            if lowered == ".git":
+                # The root .git is handled specially below. Nested repositories
+                # (or malicious .git directories) must not be writable.
+                if current_path != project:
+                    yield relative_dir / directory, True, False
+                dirnames.remove(directory)
+                continue
+            if lowered in WALK_SKIP_NAMES:
+                dirnames.remove(directory)
+                continue
+            relative = relative_dir / directory
+            if lowered in MASKED_DIRS:
+                yield relative, True, True
+                dirnames.remove(directory)
+            elif lowered == ".opencode":
+                yield relative, True, False
+                # Keep walking: nested AGENTS/opencode files and credential
+                # files still need their own read-only or masked mounts.
+        for filename in filenames:
+            lowered = filename.casefold()
+            if lowered == ".git":
+                yield relative_dir / filename, False, False
+            elif lowered in CONFIG_FILE_NAMES:
+                yield relative_dir / filename, False, False
+            elif _masked_file(filename):
+                yield relative_dir / filename, False, True
+            elif _sensitive_file(filename):
+                yield relative_dir / filename, False, not allow_secrets
+
+
+def _mask_source(
+    run_dir: Path, relative: Path, is_dir: bool, *, content: str = ""
+) -> Path:
+    masks = ensure_dir(run_dir / "masks", 0o700)
+    digest = hashlib.sha256(str(relative).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", relative.as_posix()).strip("-") or "mask"
+    source = masks / f"{safe_name[:60]}-{digest}"
+    if is_dir:
+        return ensure_dir(source, 0o700)
+    source.write_text(content, encoding="utf-8")
+    source.chmod(0o600)
+    return source
+
+
+def write_workspace_override(
+    run_dir: Path, project: Path, mode: str, *, allow_secrets: bool = False
+) -> None:
+    network_dir = ensure_dir(run_dir / "network", 0o700)
+    (network_dir / "resolv.conf").write_text(
+        "# The sandbox intentionally has no working resolver.\n"
+        "# Docker's embedded resolver (127.0.0.11) is also dropped by the firewall.\n"
+        "nameserver 127.0.0.1\n",
+        encoding="utf-8",
+    )
+    (network_dir / "hosts").write_text(
+        "\n".join(
+            [
+                "127.0.0.1 localhost",
+                "::1 localhost",
+                "172.31.240.2 llm-gateway",
+                "172.31.240.3 sandbox",
+                "172.31.240.4 sandbox-egress",
+                "172.31.240.5 egress-broker",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    lines: list[str] = ["services:", "  sandbox:", "    volumes:"]
+    add_volume(lines, network_dir / "resolv.conf", "/etc/resolv.conf", read_only=True)
+    add_volume(lines, network_dir / "hosts", "/etc/hosts", read_only=True)
+    if mode == "snapshot":
+        add_volume(lines, run_dir / "workspace", "/workspace", read_only=False)
+    else:
+        add_volume(lines, project, "/workspace", read_only=False)
+
+        seen: set[str] = set()
+        for relative, is_dir, masked in _iter_sensitive_paths(
+            project, allow_secrets=allow_secrets
+        ):
+            target = relative.as_posix()
+            if target in seen:
+                continue
+            seen.add(target)
+            source = project / relative
+            if masked:
+                mask = _mask_source(run_dir, relative, is_dir or source.is_dir())
+                add_volume(lines, mask, f"/workspace/{target}", read_only=True)
+                continue
+            if source.is_symlink():
+                fail(
+                    f"refusing symlinked protected path in direct mode: {target}; "
+                    "resolve it or use snapshot mode"
+                )
+            # Only mount paths that already exist. Creating a mountpoint below
+            # the host bind mount would create an empty file/directory in the
+            # user's repository, which is unacceptable. Missing protected paths
+            # are reported by the post-run audit instead.
+            if source.exists():
+                add_volume(lines, source, f"/workspace/{target}", read_only=True)
+
+        # Even when a control-plane file is absent, do not let the agent create
+        # it during the session and have OpenCode hot-reload new permissions,
+        # plugins, or instructions. Mount an empty read-only placeholder.
+        for relative, is_dir in (
+            (".opencode", True),
+            ("opencode.json", False),
+            ("opencode.jsonc", False),
+            ("AGENTS.md", False),
+        ):
+            if relative in seen:
+                continue
+            source = project / relative
+            if source.is_symlink():
+                fail(f"refusing symlinked protected path in direct mode: {relative}")
+            if source.exists():
+                add_volume(lines, source, f"/workspace/{relative}", read_only=True)
+                seen.add(relative)
+                continue
+            placeholder = "{}\n" if relative in {"opencode.json", "opencode.jsonc"} else ""
+            mask = _mask_source(run_dir, Path(relative), is_dir, content=placeholder)
+            add_volume(lines, mask, f"/workspace/{relative}", read_only=True)
+            seen.add(relative)
+
+        git_dir = project / ".git"
+        if git_dir.is_symlink():
+            fail("refusing to mount a project .git that is a symlink")
+        if mode == "direct":
+            if not git_dir.is_dir():
+                fail(
+                    "direct mode requires a normal .git directory; use snapshot mode for worktrees"
+                )
+            add_volume(lines, git_dir, "/workspace/.git", read_only=True)
+        elif mode == "direct-commit":
+            if not git_dir.is_dir():
+                fail(
+                    "direct-commit requires a normal .git directory; use snapshot mode for worktrees"
+                )
+            for current, dirnames, filenames in os.walk(git_dir, followlinks=False):
+                for name in [*dirnames, *filenames]:
+                    path = Path(current) / name
+                    if path.is_symlink():
+                        fail(
+                            "refusing direct-commit with a symlink inside .git: "
+                            f"{path.relative_to(project)} -> {os.readlink(path)}"
+                        )
+            for relative in [
+                ".git/hooks",
+                ".git/info",
+                ".git/modules",
+                ".git/worktrees",
+                ".git/objects/info",
+                ".git/config",
+                ".git/config.worktree",
+            ]:
+                source = project / relative
+                if source.is_symlink():
+                    fail(
+                        f"refusing symlinked .git metadata path in direct-commit mode: {relative}"
+                    )
+                if not source.exists():
+                    if relative == ".git/config":
+                        source.touch(mode=0o644)
+                    else:
+                        source.mkdir(parents=True, exist_ok=True)
+                add_volume(lines, source, f"/workspace/{relative}", read_only=True)
+        else:
+            fail(f"unknown workspace mode: {mode}")
+
+    lines.extend(
+        [
+            "    environment:",
+            f"      SANDBOX_WORKSPACE_MODE: {yaml_quote(mode)}",
+        ]
+    )
+    if mode == "direct":
+        lines.append('      GIT_OPTIONAL_LOCKS: "0"')
+
+    path = workspace_override_path()
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    print(f"workspace override: {path}")
+
+
+def compose_env(cfg: dict[str, str], run_dir: Path, mode: str, egress: str) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPOSE_PROJECT_NAME": cfg.get("COMPOSE_PROJECT_NAME", "agent-paladin"),
+            "AGENT_UID": str(os.getuid()),
+            "AGENT_GID": str(os.getgid()),
+            "SANDBOX_HOME_DIR": str(run_dir / "home"),
+            "SANDBOX_WORKSPACE_MODE": mode,
+            "SANDBOX_EGRESS_MODE": egress,
+            "SANDBOX_RUNTIME": cfg.get("SANDBOX_RUNTIME", "runc"),
+            "DLP_ACTION": cfg.get("DLP_ACTION", "block"),
+        }
+    )
+    return env
+
+
+def compose(
+    cfg: dict[str, str],
+    files: list[Path],
+    run_dir: Path,
+    mode: str,
+    egress: str,
+    args: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = compose_env(cfg, run_dir, mode, egress)
+    if extra_env:
+        env.update(extra_env)
+    command = compose_command(files, project_name=cfg.get("COMPOSE_PROJECT_NAME"))
+    command.extend(args)
+    is_sandbox_run = (
+        bool(args)
+        and args[0] == "run"
+        and "sandbox" in args
+        and "sandbox-firewall" not in args
+    )
+    result = subprocess.run(
+        command,
+        env=env,
+        capture_output=capture,
+        text=True,
+        check=False,
+        stdin=None if is_sandbox_run else subprocess.DEVNULL,
+    )
+    if check and result.returncode != 0:
+        if capture and result.stderr:
+            fail(result.stderr.strip())
+        fail(f"docker compose failed: {' '.join(command)}")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", choices=sorted(PROFILE_DEFAULTS), default=None)
+    parser.add_argument("--workspace", choices=["snapshot", "direct", "direct-commit"], default=None)
+    parser.add_argument("--egress", choices=["deny", "allowlist", "broker"], default=None)
+    parser.add_argument("--allow", action="append", default=[])
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--project", default=None)
+    parser.add_argument("--run", "-r", dest="message", default=None)
+    parser.add_argument("--shell", action="store_true")
+    parser.add_argument("--ack-external-model", action="store_true")
+    parser.add_argument("--allow-secrets", action="store_true")
+    parser.add_argument("--unsafe-no-firewall", action="store_true")
+    parser.add_argument("--no-preflight", action="store_true")
+    parser.add_argument("--build", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("extra", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+
+    if args.shell and args.message is not None:
+        fail("--shell and --run cannot be combined")
+
+    cfg = config()
+    explicit_profile = args.profile is not None or bool(os.environ.get("PROFILE"))
+    profile = args.profile or os.environ.get("PROFILE") or "edit"
+    if profile not in PROFILE_DEFAULTS:
+        fail(f"unknown profile: {profile}")
+    defaults = PROFILE_DEFAULTS[profile]
+    if args.workspace:
+        mode = args.workspace
+    elif explicit_profile:
+        mode = defaults["workspace"]
+    else:
+        mode = cfg.get("WORKSPACE_MODE", defaults["workspace"])
+    if args.egress:
+        egress = args.egress
+    elif explicit_profile:
+        egress = defaults["egress"]
+    else:
+        egress = cfg.get("SANDBOX_EGRESS", defaults["egress"])
+    if mode not in {"snapshot", "direct", "direct-commit"}:
+        fail(f"invalid WORKSPACE_MODE: {mode}")
+    if egress not in {"deny", "allowlist", "broker"}:
+        fail(f"invalid SANDBOX_EGRESS: {egress}")
+    if cfg.get("STATE_MODE", "run") not in {"run", "project"}:
+        fail(f"invalid STATE_MODE: {cfg.get('STATE_MODE')}")
+    if args.allow and egress != "allowlist":
+        print(
+            "warning: --allow is ignored unless egress mode is allowlist",
+            file=sys.stderr,
+        )
+    if profile == "local":
+        active_profiles = [
+            item for item in os.environ.get("COMPOSE_PROFILES", "").split(",") if item
+        ]
+        if "ollama" not in active_profiles:
+            active_profiles.append("ollama")
+        os.environ["COMPOSE_PROFILES"] = ",".join(active_profiles)
+    if profile == "confidential":
+        ack = args.ack_external_model or cfg.get("EXTERNAL_MODEL_ACK") == "1"
+        if not ack:
+            fail(
+                "profile confidential requires --ack-external-model (or EXTERNAL_MODEL_ACK=1): "
+                "the external model provider receives the confidential code"
+            )
+    firewall_on = cfg.get("SANDBOX_FIREWALL", "on") != "off"
+    if args.unsafe_no_firewall:
+        firewall_on = False
+    if not firewall_on and not args.unsafe_no_firewall:
+        fail("SANDBOX_FIREWALL=off requires --unsafe-no-firewall")
+    if not firewall_on:
+        print("WARNING: firewall is disabled; using Docker internal networks only", file=sys.stderr)
+
+    project_value = args.project or cfg.get("PROJECT_DIR")
+    if not project_value:
+        cwd = Path.cwd().resolve()
+        if cwd != ROOT:
+            project_value = str(cwd)
+        else:
+            fail(
+                "PROJECT_DIR is not set. Run paladin from your project directory "
+                "(e.g., 'cd ~/my-project && paladin') or pass --project <dir>"
+            )
+    project = Path(project_value).expanduser().resolve()
+    if not project.is_dir():
+        fail(f"project directory does not exist: {project}")
+    validate_project_path(project, cfg, mode)
+    if mode != "snapshot" and egress != "deny":
+        print(
+            "WARNING: direct workspace + egress is reduced assurance; use snapshot mode for untrusted code.",
+            file=sys.stderr,
+        )
+    if mode in {"direct", "direct-commit"} and not (project / ".git").exists():
+        fail("direct modes require a Git repository; use snapshot mode for non-Git projects")
+
+    ensure_secrets()
+    if not args.no_preflight:
+        preflight_env = dict(os.environ)
+        preflight_env["PROJECT_DIR"] = str(project)
+        if profile == "local":
+            preflight_env["AGENT_PALADIN_LOCAL_ONLY"] = "1"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "preflight.py")],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=preflight_env,
+        )
+        if result.returncode != 0:
+            fail("preflight failed")
+
+    run_id = make_run_id()
+    state_dir = ensure_dir(Path(cfg["STATE_DIR"]), 0o700)
+    runs_dir = ensure_dir(state_dir / "runs", 0o700)
+    run_dir = ensure_dir(runs_dir / run_id, 0o700)
+    home = run_dir / "home"
+    if cfg.get("STATE_MODE") == "project":
+        shared_home = ensure_dir(
+            state_dir / "projects" / project_slug(project) / "home",
+            0o700,
+        )
+        if home.is_symlink() or home.exists():
+            remove_path(home)
+        home.symlink_to(shared_home, target_is_directory=True)
+        # A resumed session must not inherit executable shell startup state or
+        # an OpenCode config/plugin directory written by a previous agent run.
+        # The container entrypoint recreates a canonical .bashrc on every start.
+        for startup_name in [
+            ".bashrc",
+            ".profile",
+            ".bash_profile",
+            ".bash_login",
+            ".bash_logout",
+            ".bash_history",
+            ".zsh_history",
+            ".python_history",
+            ".lesshst",
+        ]:
+            startup_file = shared_home / startup_name
+            if startup_file.is_symlink() or startup_file.exists():
+                try:
+                    remove_path(startup_file)
+                    print(
+                        f"warning: reset shell startup file in shared state: {startup_name}",
+                        file=sys.stderr,
+                    )
+                except OSError:
+                    pass
+        config_root = shared_home / ".config"
+        if config_root.is_symlink() or (
+            config_root.exists() and not config_root.is_dir()
+        ):
+            try:
+                remove_path(config_root)
+                print(
+                    "warning: reset unusable shared .config path",
+                    file=sys.stderr,
+                )
+            except OSError:
+                pass
+        else:
+            for relative in ("opencode",):
+                managed = config_root / relative
+                if managed.is_symlink() or managed.exists():
+                    try:
+                        remove_path(managed)
+                        print(
+                            "warning: reset shared OpenCode config/plugin directory",
+                            file=sys.stderr,
+                        )
+                    except OSError:
+                        pass
+        print(f"using shared project state: {shared_home}")
+    else:
+        ensure_dir(home, 0o700)
+    ensure_dir(run_dir / "export", 0o700)
+
+    manifest: dict[str, object] = {
+        "run_id": run_id,
+        "created_at": now_iso(),
+        "project_dir": str(project),
+        "workspace_mode": mode,
+        "egress_mode": egress,
+        "profile": profile,
+        "runtime": cfg.get("SANDBOX_RUNTIME", "runc"),
+        "firewall": firewall_on,
+        "external_model_ack": bool(args.ack_external_model or cfg.get("EXTERNAL_MODEL_ACK") == "1"),
+        "home": str(home),
+        "images": latest_images(),
+    }
+
+    if mode == "snapshot":
+        print(f"creating sanitized snapshot for {project}")
+        snapshot_cmd = [
+            sys.executable,
+            str(ROOT / "scripts" / "snapshot.py"),
+            "--source",
+            str(project),
+            "--dest",
+            str(run_dir / "workspace"),
+            "--manifest",
+            str(run_dir / "snapshot.json"),
+        ]
+        if args.allow_secrets:
+            snapshot_cmd.append("--allow-secrets")
+        snapshot_result = subprocess.run(
+            snapshot_cmd,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if snapshot_result.returncode != 0:
+            fail("snapshot creation or secret scan failed")
+        snapshot_manifest = json.loads((run_dir / "snapshot.json").read_text(encoding="utf-8"))
+        manifest["baseline"] = snapshot_manifest.get("baseline")
+        manifest["snapshot"] = snapshot_manifest
+    else:
+        print("scanning direct workspace for secret patterns")
+        scan = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "secret_scan.py"),
+                "--root",
+                str(project),
+            ],
+            text=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if scan.returncode != 0:
+            if not args.allow_secrets:
+                print(
+                    "Direct workspace contains secret-like patterns. Use snapshot mode, remove them, "
+                    "or pass --allow-secrets if you accept the risk.",
+                    file=sys.stderr,
+                )
+                fail("direct workspace secret scan failed")
+            print("WARNING: continuing despite secret scan findings", file=sys.stderr)
+
+    domains: list[str] = []
+    if egress == "allowlist":
+        domains = split_domains(args.allow)
+        if not domains:
+            domains = split_domains([cfg.get("SANDBOX_ALLOWED_DOMAINS", "")])
+        domains = validate_domains(domains)
+        if not domains:
+            fail(
+                "allowlist egress requires at least one domain; pass --allow or set SANDBOX_ALLOWED_DOMAINS"
+            )
+        allow_path = generated_dir() / "sandbox-allow.txt"
+        allow_path.write_text("\n".join(domains) + "\n", encoding="utf-8")
+        allow_path.chmod(0o644)
+        manifest["allowed_domains"] = domains
+    elif egress == "broker":
+        broker_config = ROOT / "config" / "broker" / "config.json"
+        try:
+            broker = json.loads(broker_config.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            broker = {}
+        broker_domains = broker.get("approvable_domains", [])
+        if not broker_domains:
+            print(
+                "WARNING: config/broker/config.json has no approvable_domains; all API requests will be denied.",
+                file=sys.stderr,
+            )
+        manifest["approvable_domains"] = broker_domains
+
+    render_args = [
+        sys.executable,
+        str(ROOT / "scripts" / "render_config.py"),
+        "--profile",
+        profile,
+        "--out",
+        str(generated_dir()),
+    ]
+    if args.model:
+        render_args.extend(["--default", args.model])
+    if profile == "local":
+        render_args.append("--local-only")
+    render_result = subprocess.run(render_args, check=False, stdin=subprocess.DEVNULL)
+    if render_result.returncode != 0:
+        fail("model configuration is not usable")
+    available = json.loads((generated_dir() / "available.json").read_text(encoding="utf-8"))
+    manifest["model"] = available.get("default")
+    manifest["available_models"] = available.get("available", [])
+    manifest["unavailable_models"] = available.get("missing", [])
+
+    write_workspace_override(
+        run_dir, project, mode, allow_secrets=bool(args.allow_secrets)
+    )
+    shutil.copyfile(workspace_override_path(), run_dir / "compose.workspace.yaml")
+    manifest["workspace_override"] = str(run_dir / "compose.workspace.yaml")
+
+    files = compose_files(egress)
+    files.append(workspace_override_path())
+    build_services = [
+        "sandbox",
+        "sandbox-firewall",
+        "llm-gateway",
+        "prompt-dlp",
+        "llm-proxy",
+        "llm-egress",
+    ]
+    services = ["sandbox", "llm-gateway", "prompt-dlp", "llm-proxy", "llm-egress"]
+    if egress == "allowlist":
+        build_services.append("sandbox-egress")
+        services.append("sandbox-egress")
+    if egress == "broker":
+        build_services.append("egress-broker")
+        services.append("egress-broker")
+    if profile == "local":
+        build_services.append("ollama-egress")
+        services.extend(["ollama-egress", "ollama"])
+
+    manifest_path = run_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    if args.dry_run:
+        print("docker compose files:", *[str(path) for path in files], sep="\n  ")
+        print("services:", ", ".join(services))
+        print("manifest:", manifest_path)
+        return 0
+
+    available_images = latest_images()
+    required_images = {
+        "agent",
+        "gateway",
+        "prompt_dlp",
+        "litellm",
+        "egress",
+        "firewall",
+    }
+    if egress == "broker":
+        required_images.add("broker")
+    missing_images = sorted(required_images - set(available_images))
+    if args.build or missing_images:
+        if missing_images:
+            print(f"missing images: {', '.join(missing_images)}")
+        print("building images")
+        compose(cfg, files, run_dir, mode, egress, ["build", *build_services])
+
+    manifest["images"] = latest_images()
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    up_services = ["sandbox-netns", "llm-gateway", "prompt-dlp", "llm-proxy", "llm-egress"]
+    if egress == "allowlist":
+        up_services.append("sandbox-egress")
+    if egress == "broker":
+        up_services.append("egress-broker")
+    if profile == "local":
+        up_services.extend(["ollama-egress", "ollama"])
+    print("starting proxy chain")
+    compose(
+        cfg,
+        files,
+        run_dir,
+        mode,
+        egress,
+        ["up", "-d", "--wait", "--remove-orphans", *up_services],
+    )
+
+    if firewall_on:
+        print("applying sandbox firewall")
+        compose(
+            cfg,
+            files,
+            run_dir,
+            mode,
+            egress,
+            ["run", "--rm", "--no-deps", "sandbox-firewall"],
+        )
+
+    run_command = ["run", "--rm"]
+    if args.shell:
+        run_command.extend(["--entrypoint", "/bin/bash"])
+    if args.message is None:
+        run_command.append("-i")
+    if args.message is not None or not sys.stdin.isatty():
+        run_command.append("-T")
+    run_command.extend(["--no-deps", "sandbox"])
+    if args.message is not None:
+        run_command.extend(["run", args.message])
+    if args.extra:
+        if args.extra and args.extra[0] == "--":
+            args.extra = args.extra[1:]
+        run_command.extend(args.extra)
+
+    print(f"starting sandbox run {run_id}")
+    sandbox_result = compose(
+        cfg,
+        files,
+        run_dir,
+        mode,
+        egress,
+        run_command,
+        check=False,
+    )
+
+    manifest["finished_at"] = now_iso()
+    manifest["exit_code"] = sandbox_result.returncode
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    if mode == "snapshot":
+        print("\nchecking exported changes")
+        post = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "export_patch.py"),
+                "--run",
+                str(run_dir),
+            ],
+            check=False,
+        )
+    else:
+        print("\nauditing direct-mount changes")
+        post = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "audit_changes.py"),
+                "--project",
+                str(project),
+            ],
+            check=False,
+        )
+
+    if sandbox_result.returncode != 0:
+        return sandbox_result.returncode
+    if post.returncode != 0:
+        print(
+            "warning: the post-run safety check did not pass; "
+            "review the report before using the workspace",
+            file=sys.stderr,
+        )
+        return post.returncode
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

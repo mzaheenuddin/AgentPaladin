@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Recreate the proxy services after a configuration change.
+
+The sandbox itself is disposable and is recreated by bin/agent. The long-lived
+proxy chain, however, reads its configuration at startup. This helper recreates
+the affected services using the latest run's compose files and environment.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import (  # noqa: E402
+    compose_command,
+    compose_files,
+    config,
+    fail,
+)
+
+
+def latest_manifest(state_dir: Path) -> tuple[Path, dict] | tuple[None, dict]:
+    runs = sorted(
+        [path for path in (state_dir / "runs").glob("*") if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run in runs:
+        manifest = run / "manifest.json"
+        if manifest.exists():
+            try:
+                return run, json.loads(manifest.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+    return None, {}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="recreate proxy services even if a sandbox container is running",
+    )
+    args = parser.parse_args(argv)
+
+    cfg = config()
+    state_dir = Path(cfg["STATE_DIR"])
+    run_dir, manifest = latest_manifest(state_dir)
+    if run_dir is None:
+        fail("no run found; start one with bin/agent first")
+
+    egress = manifest.get("egress_mode", cfg.get("SANDBOX_EGRESS", "deny"))
+    files = compose_files(egress)
+    workspace_override = Path(
+        manifest.get(
+            "workspace_override",
+            run_dir / "compose.workspace.yaml",
+        )
+    )
+    if not workspace_override.exists():
+        fail(f"workspace override is missing: {workspace_override}")
+    files.append(workspace_override)
+
+    home = Path(manifest.get("home", ""))
+    if not home.is_dir():
+        fail("the latest run has no usable home directory")
+
+    project = cfg.get("COMPOSE_PROJECT_NAME", "agent-paladin")
+    running = subprocess.run(
+        ["docker", "ps", "--filter", f"name={project}-sandbox-run-", "--format", "{{.Names}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if running.stdout.strip() and not args.force:
+        fail(
+            "a sandbox container is running; exit it before reloading, "
+            "or pass --force to accept a broken session"
+        )
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPOSE_PROJECT_NAME": project,
+            "AGENT_UID": str(os.getuid()),
+            "AGENT_GID": str(os.getgid()),
+            "SANDBOX_HOME_DIR": str(home),
+            "SANDBOX_WORKSPACE_MODE": manifest.get("workspace_mode", "snapshot"),
+            "SANDBOX_EGRESS_MODE": egress,
+            "SANDBOX_RUNTIME": manifest.get("runtime", cfg.get("SANDBOX_RUNTIME", "runc")),
+            "DLP_ACTION": cfg.get("DLP_ACTION", "block"),
+        }
+    )
+
+    services = ["llm-egress", "llm-proxy", "prompt-dlp", "llm-gateway"]
+    if egress == "allowlist":
+        services.append("sandbox-egress")
+    if egress == "broker":
+        services.append("egress-broker")
+
+    command = compose_command(files, project_name=project)
+    if manifest.get("profile") == "local":
+        command.extend(["--profile", "ollama"])
+    command.extend(["up", "-d", "--force-recreate", "--wait", "--remove-orphans", *services])
+    print("recreating proxy services:", ", ".join(services))
+    return subprocess.run(command, env=env, check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

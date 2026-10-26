@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Stop the Agent Paladin compose project."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import compose_command, compose_files, config, ensure_dir, fail  # noqa: E402
+
+
+def latest_manifest(state_dir: Path) -> dict:
+    runs = sorted(
+        [path for path in (state_dir / "runs").glob("*") if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run in runs:
+        manifest = run / "manifest.json"
+        if manifest.exists():
+            try:
+                return json.loads(manifest.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+    return {}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--volumes", action="store_true")
+    args = parser.parse_args(argv)
+    cfg = config()
+    state_dir = Path(cfg["STATE_DIR"])
+    manifest = latest_manifest(state_dir)
+    egress = manifest.get("egress_mode", cfg.get("SANDBOX_EGRESS", "deny"))
+    files = compose_files(egress)
+    workspace_override = Path(
+        manifest.get("workspace_override", ROOT / ".agent" / "generated" / "compose.workspace.yaml")
+    )
+    if workspace_override.exists():
+        files.append(workspace_override)
+    home = Path(manifest.get("home", state_dir / "runtime-home"))
+    ensure_dir(home, 0o700)
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPOSE_PROJECT_NAME": cfg.get("COMPOSE_PROJECT_NAME", "agent-paladin"),
+            "AGENT_UID": str(os.getuid()),
+            "AGENT_GID": str(os.getgid()),
+            "SANDBOX_HOME_DIR": str(home),
+            "SANDBOX_WORKSPACE_MODE": manifest.get("workspace_mode", "snapshot"),
+            "SANDBOX_EGRESS_MODE": egress,
+        }
+    )
+    command = compose_command(files, project_name=cfg.get("COMPOSE_PROJECT_NAME"))
+    command.extend(["--profile", "ollama", "down", "--remove-orphans"])
+    if args.volumes:
+        command.append("--volumes")
+    return subprocess.run(command, env=env, check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

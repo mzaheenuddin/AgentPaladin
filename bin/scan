@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import config  # noqa: E402
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", nargs="?", default=None)
+    parser.add_argument("--git-only", action="store_true")
+    parser.add_argument("--include-entropy", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    target = args.path or config().get("PROJECT_DIR", "")
+    if not target:
+        cwd = Path.cwd().resolve()
+        if cwd != ROOT:
+            target = str(cwd)
+        else:
+            print("error: PROJECT_DIR is not set; run inside your project or pass a path", file=sys.stderr)
+            raise SystemExit(2)
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "secret_scan.py"),
+        "--root",
+        target,
+    ]
+    if args.git_only:
+        command.append("--git-only")
+    if args.include_entropy:
+        command.append("--include-entropy")
+    if args.json:
+        command.append("--json")
+    raise SystemExit(subprocess.run(command, check=False).returncode)

@@ -1,0 +1,21 @@
+# Generated state and runtime artifacts
+.agent/
+*.log
+
+# Secrets must never be committed
+secrets/*
+!secrets/.gitkeep
+!secrets/broker/
+secrets/broker/*
+!secrets/broker/.gitkeep
+
+# Local configuration
+.env
+config/agent.env
+
+# OS noise
+.DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc

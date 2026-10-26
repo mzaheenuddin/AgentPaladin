@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""Verify the active sandbox and host-side security posture."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import (  # noqa: E402
+    compose_command,
+    compose_files,
+    config,
+    fail,
+    git_safe_env,
+)
+
+FAILURES: list[str] = []
+WARNINGS: list[str] = []
+
+
+def pass_(message: str) -> None:
+    print(f"PASS  {message}")
+
+
+def warn(message: str) -> None:
+    WARNINGS.append(message)
+    print(f"WARN  {message}")
+
+
+def fail_(message: str) -> None:
+    FAILURES.append(message)
+    print(f"FAIL  {message}")
+
+
+def check(condition: bool, message: str) -> None:
+    if condition:
+        pass_(message)
+    else:
+        fail_(message)
+
+
+def latest_run(state_dir: Path) -> Path | None:
+    runs = []
+    for path in (state_dir / "runs").glob("*"):
+        if path.is_dir() and (path / "manifest.json").is_file():
+            runs.append(path)
+    runs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return runs[0] if runs else None
+
+
+def host_can_connect(host: str, port: int, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def run_dir_from_arg(value: str | None, cfg: dict[str, str]) -> Path:
+    if value:
+        path = Path(value)
+        if path.is_dir():
+            return path.resolve()
+        path = Path(cfg["STATE_DIR"]) / "runs" / value
+        if path.is_dir():
+            return path.resolve()
+        fail(f"run not found: {value}")
+    latest = latest_run(Path(cfg["STATE_DIR"]))
+    if latest is None:
+        fail("no run found; start one with bin/agent first")
+    return latest
+
+
+def compose_env(cfg: dict[str, str], manifest: dict) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPOSE_PROJECT_NAME": cfg.get("COMPOSE_PROJECT_NAME", "agent-paladin"),
+            "AGENT_UID": str(os.getuid()),
+            "AGENT_GID": str(os.getgid()),
+            "SANDBOX_HOME_DIR": manifest.get("home", ""),
+            "SANDBOX_WORKSPACE_MODE": manifest.get("workspace_mode", "snapshot"),
+            "SANDBOX_EGRESS_MODE": manifest.get("egress_mode", "deny"),
+            "SANDBOX_RUNTIME": manifest.get("runtime", cfg.get("SANDBOX_RUNTIME", "runc")),
+            "DLP_ACTION": cfg.get("DLP_ACTION", "block"),
+        }
+    )
+    return env
+
+
+def docker(
+    cfg: dict[str, str],
+    manifest: dict,
+    files: list[Path],
+    args: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    command = compose_command(files, project_name=cfg.get("COMPOSE_PROJECT_NAME"))
+    command.extend(args)
+    result = subprocess.run(
+        command,
+        env=compose_env(cfg, manifest),
+        text=True,
+        capture_output=capture,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        fail(f"docker compose failed: {' '.join(command)}")
+    return result
+
+
+def flatten_environment(value: object) -> dict[str, str]:
+    if isinstance(value, dict):
+        return {str(key): str(item) for key, item in value.items()}
+    if isinstance(value, list):
+        result: dict[str, str] = {}
+        for item in value:
+            if isinstance(item, str) and "=" in item:
+                key, _, val = item.partition("=")
+                result[key] = val
+            elif isinstance(item, dict):
+                for key, val in item.items():
+                    result[str(key)] = str(val)
+        return result
+    return {}
+
+
+def service_networks(service: dict) -> set[str]:
+    networks = service.get("networks", {})
+    if isinstance(networks, dict):
+        return set(networks)
+    if isinstance(networks, list):
+        return {str(item) for item in networks}
+    return set()
+
+
+def service_secret_names(service: dict) -> set[str]:
+    secrets = service.get("secrets", [])
+    names: set[str] = set()
+    if isinstance(secrets, list):
+        for item in secrets:
+            if isinstance(item, str):
+                names.add(item)
+            elif isinstance(item, dict):
+                names.add(str(item.get("source", item.get("target", ""))))
+    return names
+
+
+def service_volume_sources(service: dict) -> list[str]:
+    sources: list[str] = []
+    for item in service.get("volumes", []) or []:
+        if isinstance(item, dict):
+            source = item.get("source")
+            if source:
+                sources.append(str(source))
+        elif isinstance(item, str):
+            sources.append(item.split(":", 1)[0])
+    return sources
+
+
+def check_compose_config(cfg: dict[str, str], manifest: dict, files: list[Path]) -> None:
+    result = docker(cfg, manifest, files, ["config", "--format", "json"], capture=True)
+    try:
+        config_data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        fail_("docker compose config did not return JSON")
+        return
+    services = config_data.get("services", {})
+    sandbox = services.get("sandbox", {})
+    if not sandbox:
+        fail_("sandbox service is missing from compose config")
+        return
+
+    check(sandbox.get("read_only") is True, "sandbox root filesystem is read-only")
+    check(
+        "ALL" in {str(item).upper() for item in (sandbox.get("cap_drop") or [])},
+        "sandbox drops all capabilities",
+    )
+    check(not sandbox.get("cap_add"), "sandbox adds no capabilities")
+    security_opt = " ".join(str(item) for item in (sandbox.get("security_opt") or []))
+    check("no-new-privileges" in security_opt, "sandbox has no-new-privileges")
+    check(not sandbox.get("privileged", False), "sandbox is not privileged")
+    check(not sandbox.get("ports"), "sandbox publishes no ports")
+    check(sandbox.get("pid") not in {"host", "container"}, "sandbox does not share a host PID namespace")
+    check(sandbox.get("ipc") not in {"host"}, "sandbox does not share the host IPC namespace")
+    check(not sandbox.get("devices"), "sandbox has no host devices")
+    check(str(sandbox.get("user", "")) not in {"", "0", "0:0", "root"}, "sandbox runs as a non-root user")
+    check(
+        str(sandbox.get("network_mode", "")) == "service:sandbox-netns",
+        "sandbox shares only the controlled network namespace",
+    )
+    check(
+        "gateway_token" in service_secret_names(sandbox)
+        and len(service_secret_names(sandbox)) == 1,
+        "sandbox receives only the gateway token secret",
+    )
+    env = flatten_environment(sandbox.get("environment", {}))
+    forbidden = [
+        key
+        for key in env
+        if key in {"DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LITELLM_MASTER_KEY"}
+    ]
+    check(not forbidden, "sandbox has no provider keys in its environment")
+
+    sources = service_volume_sources(sandbox)
+    check(
+        not any(
+            source
+            in {
+                "/",
+                "/etc",
+                "/var/run/docker.sock",
+                "/run/docker.sock",
+                str(Path.home()),
+            }
+            for source in sources
+        ),
+        "sandbox mounts no host root, host etc, home root, or Docker socket",
+    )
+    check(
+        not any(
+            source.endswith(
+                ("/.ssh", "/.aws", "/.gnupg", "/.kube", "/.docker", "/secrets")
+            )
+            for source in sources
+        ),
+        "sandbox mounts no SSH or cloud credential directories",
+    )
+
+    gateway = services.get("llm-gateway", {})
+    check(bool(gateway), "LLM gateway is configured")
+    check(not gateway.get("ports"), "LLM gateway publishes no host ports")
+    check(
+        "sandbox_net" in service_networks(gateway)
+        and "control_net" in service_networks(gateway)
+        and "public_net" not in service_networks(gateway),
+        "LLM gateway is the only control/sandbox bridge",
+    )
+    check(
+        service_secret_names(gateway) == {"gateway_token", "litellm_master_key"},
+        "LLM gateway receives only its expected token/master secrets",
+    )
+
+    llm_proxy = services.get("llm-proxy", {})
+    check("sandbox_net" not in service_networks(llm_proxy), "LiteLLM is not on the sandbox network")
+    check(not llm_proxy.get("ports"), "LiteLLM publishes no ports")
+    llm_egress = services.get("llm-egress", {})
+    check(bool(llm_egress), "provider egress proxy is configured")
+    check(
+        "sandbox_net" not in service_networks(llm_egress)
+        and "control_net" not in service_networks(llm_egress),
+        "provider egress proxy is isolated from the sandbox and control networks",
+    )
+    prompt_dlp = services.get("prompt-dlp", {})
+    check(bool(prompt_dlp), "prompt DLP service is configured")
+    check(
+        "sandbox_net" not in service_networks(prompt_dlp),
+        "prompt DLP is not on the sandbox network",
+    )
+    proxy_secrets = service_secret_names(llm_proxy)
+    provider_secrets = {"deepseek_api_key", "anthropic_api_key", "openai_api_key"}
+    check("litellm_master_key" in proxy_secrets, "LiteLLM receives the master key")
+    if manifest.get("profile") != "local":
+        check(
+            bool(proxy_secrets & provider_secrets),
+            "LiteLLM receives at least one provider secret",
+        )
+    check(
+        not (proxy_secrets & provider_secrets) & service_secret_names(sandbox),
+        "LiteLLM provider secrets are not mounted in the sandbox",
+    )
+
+    firewall = services.get("sandbox-firewall", {})
+    check(bool(firewall), "sandbox firewall service is configured")
+    if firewall:
+        check(
+            str(firewall.get("network_mode", "")) == "service:sandbox-netns",
+            "sandbox firewall shares the sandbox network namespace",
+        )
+        check(
+            "NET_ADMIN" in {str(item).upper() for item in (firewall.get("cap_add") or [])},
+            "sandbox firewall has NET_ADMIN",
+        )
+        check(
+            "ALL" in {str(item).upper() for item in (firewall.get("cap_drop") or [])},
+            "sandbox firewall drops all other capabilities",
+        )
+        check(firewall.get("read_only") is True, "sandbox firewall root is read-only")
+        check(
+            "no-new-privileges"
+            in " ".join(str(item) for item in (firewall.get("security_opt") or [])),
+            "sandbox firewall has no-new-privileges",
+        )
+        check(not firewall.get("privileged", False), "sandbox firewall is not privileged")
+
+    networks = config_data.get("networks", {})
+    for name in ["sandbox_net", "control_net", "egress_net", "inference_net"]:
+        network = networks.get(name, {})
+        check(network.get("internal") is True, f"network {name} is internal")
+    public = networks.get("public_net", {})
+    check(public.get("internal") is not True, "public_net is the only egress network")
+    public_opts = public.get("driver_opts") or {}
+    check(
+        str(public_opts.get("com.docker.network.bridge.enable_icc", "")).lower()
+        == "false",
+        "public_net blocks inter-container connectivity",
+    )
+
+    if manifest.get("egress_mode") == "allowlist":
+        egress_service = services.get("sandbox-egress", {})
+        check(bool(egress_service), "allowlist proxy is configured")
+        check("sandbox_net" in service_networks(egress_service), "allowlist proxy is on the sandbox network")
+        check("control_net" not in service_networks(egress_service), "allowlist proxy cannot reach LiteLLM")
+    if manifest.get("egress_mode") == "broker":
+        broker = services.get("egress-broker", {})
+        check(bool(broker), "egress broker is configured")
+        check("sandbox_net" in service_networks(broker), "egress broker is on the sandbox network")
+        check("control_net" not in service_networks(broker), "egress broker cannot reach LiteLLM")
+        broker_env = flatten_environment(broker.get("environment", {}))
+        check(
+            broker_env.get("LISTEN_HOST") not in {"", "0.0.0.0", "::"},
+            "egress broker does not listen on the public interface",
+        )
+
+
+def check_host_secret_scan() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-paladin-scan-") as tmp:
+        path = Path(tmp) / ".env"
+        path.write_text(
+            "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n", encoding="utf-8"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "secret_scan.py"),
+                "--root",
+                tmp,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        check(result.returncode == 1, "host secret scanner blocks an AWS-looking key")
+
+
+def check_export_gate() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-paladin-export-") as tmp:
+        root = Path(tmp)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        env = git_safe_env()
+        env.update(
+            {
+                "GIT_AUTHOR_NAME": "Verify",
+                "GIT_AUTHOR_EMAIL": "verify@localhost",
+                "GIT_COMMITTER_NAME": "Verify",
+                "GIT_COMMITTER_EMAIL": "verify@localhost",
+            }
+        )
+        subprocess.run(["git", "-C", str(workspace), "init", "-q"], env=env, check=False)
+        (workspace / "README.md").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(workspace), "add", "-A"], env=env, check=False)
+        commit = subprocess.run(
+            ["git", "-C", str(workspace), "commit", "-q", "-m", "baseline"],
+            env=env,
+            check=False,
+        )
+        if commit.returncode != 0:
+            fail_("could not create export-gate test repository")
+            return
+        baseline = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        ).stdout.strip()
+        blocked_cases = {
+            ".github/workflows/ci.yml": "changed CI workflow",
+            "packages/app/.opencode/opencode.json": "nested OpenCode config",
+            ".vscode/tasks.json": "VS Code task file",
+            "secrets/key.txt": "nested secrets directory",
+            ".ENV": "case-variant env file",
+        }
+        for relative, _label in blocked_cases.items():
+            path = workspace / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("test\n", encoding="utf-8")
+        (workspace / "safe.txt").write_text("safe\n", encoding="utf-8")
+        # Simulate an agent-controlled .git/config that tries to execute a
+        # clean filter (and fsmonitor) on the host during export. The export
+        # sanitizer must remove this metadata before running Git.
+        filter_canary = root / "git-filter-fired"
+        with (workspace / ".git" / "config").open("a", encoding="utf-8") as handle:
+            handle.write(
+                f'\n[filter "evil"]\n\tclean = touch {filter_canary}\n'
+                f"\trequired = true\n[core]\n\tfsmonitor = touch {filter_canary}\n"
+            )
+        (workspace / ".gitattributes").write_text("*.txt filter=evil\n", encoding="utf-8")
+        (workspace / "filtered.txt").write_text("filter me\n", encoding="utf-8")
+        manifest = {
+            "workspace_mode": "snapshot",
+            "baseline": baseline,
+            "project_dir": str(root / "project"),
+        }
+        (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "export_patch.py"),
+                "--run",
+                str(root),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        check(result.returncode == 1, "export gate blocks unsafe changes")
+        check(
+            not filter_canary.exists(),
+            "export does not execute snapshot Git filters or fsmonitor commands",
+        )
+        report_path = root / "export" / "report.json"
+        if not report_path.exists():
+            fail_("export gate did not write report.json")
+            return
+        blocked = set(json.loads(report_path.read_text(encoding="utf-8")).get("blocked_paths", []))
+        for relative, label in blocked_cases.items():
+            check(relative in blocked, f"export gate blocks {label}")
+
+
+def check_runtime(cfg: dict[str, str], manifest: dict, files: list[Path]) -> None:
+    services = ["sandbox-netns", "llm-gateway", "prompt-dlp", "llm-proxy", "llm-egress"]
+    if manifest.get("egress_mode") == "allowlist":
+        services.append("sandbox-egress")
+    if manifest.get("egress_mode") == "broker":
+        services.append("egress-broker")
+    prefix = ["--profile", "ollama"] if manifest.get("profile") == "local" else []
+    docker(cfg, manifest, files, [*prefix, "up", "-d", "--wait", "--remove-orphans", *services])
+    if manifest.get("firewall", True):
+        docker(
+            cfg,
+            manifest,
+            files,
+            ["run", "--rm", "--no-deps", "sandbox-firewall"],
+        )
+
+    result = docker(
+        cfg,
+        manifest,
+        files,
+        [
+            "run",
+            "--rm",
+            "-T",
+            "--no-deps",
+            "--entrypoint",
+            "/usr/local/bin/verify-security.sh",
+            "sandbox",
+        ],
+        check=False,
+    )
+    check(result.returncode == 0, "sandbox security assertions pass")
+
+    # Host-to-sandbox: a listener inside the sandbox must not be reachable from
+    # the host. This exercises the INPUT DROP side of the firewall.
+    if manifest.get("firewall", True):
+        name = f"agent-paladin-verify-listener-{os.getpid()}"
+        subprocess.run(
+            ["docker", "rm", "-f", name],
+            capture_output=True,
+            check=False,
+        )
+        start = docker(
+            cfg,
+            manifest,
+            files,
+            [
+                "run",
+                "-d",
+                "-T",
+                "--no-deps",
+                "--name",
+                name,
+                "--entrypoint",
+                "/bin/bash",
+                "sandbox",
+                "-lc",
+                "exec nc -l -p 9999",
+            ],
+            capture=True,
+            check=False,
+        )
+        running = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if start.returncode == 0 and running.stdout.strip() == "true":
+            time.sleep(1)
+            check(
+                not host_can_connect("172.31.240.3", 9999),
+                "host cannot initiate a connection into the sandbox",
+            )
+        else:
+            warn("could not start the host-to-sandbox listener test")
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+
+    dlp = docker(
+        cfg,
+        manifest,
+        files,
+        ["exec", "-T", "prompt-dlp", "python", "/app/leak_test.py"],
+        check=False,
+    )
+    check(dlp.returncode == 0, "prompt DLP canary test passes")
+
+    if manifest.get("egress_mode") == "broker":
+        broker = docker(
+            cfg,
+            manifest,
+            files,
+            ["exec", "-T", "egress-broker", "python", "/app/leak_test.py"],
+            check=False,
+        )
+        check(broker.returncode == 0, "egress broker DLP/validation tests pass")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", default=None)
+    parser.add_argument("--no-start", action="store_true")
+    args = parser.parse_args(argv)
+    cfg = config()
+    run_path = run_dir_from_arg(args.run, cfg)
+    manifest_path = run_path / "manifest.json"
+    if not manifest_path.exists():
+        fail(f"manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    home = Path(manifest.get("home", ""))
+    if not home.is_dir():
+        fail(f"run home directory is missing: {home}")
+
+    workspace_override = Path(
+        manifest.get("workspace_override", run_path / "compose.workspace.yaml")
+    )
+    if not workspace_override.exists():
+        fail(f"workspace override is missing: {workspace_override}")
+    files = compose_files(manifest.get("egress_mode", "deny"))
+    files.append(workspace_override)
+
+    print("== host posture ==")
+    check_compose_config(cfg, manifest, files)
+    check_host_secret_scan()
+    check_export_gate()
+
+    if not args.no_start:
+        print("\n== runtime posture ==")
+        check_runtime(cfg, manifest, files)
+
+    print("\n")
+    if FAILURES:
+        print(f"verification failed with {len(FAILURES)} failure(s)")
+        for failure in FAILURES:
+            print(f"  - {failure}")
+        return 1
+    if WARNINGS:
+        print(f"verification passed with {len(WARNINGS)} warning(s)")
+    else:
+        print("verification passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

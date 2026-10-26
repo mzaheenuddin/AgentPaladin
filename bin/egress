@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Host-side commands for the approval-based egress broker."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import compose_command, compose_files, config, fail  # noqa: E402
+
+
+def latest_run(state_dir: Path) -> Path | None:
+    runs = sorted(
+        [path for path in (state_dir / "runs").glob("*") if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return runs[0] if runs else None
+
+
+def main(argv: list[str]) -> int:
+    cfg = config()
+    run = latest_run(Path(cfg["STATE_DIR"]))
+    if run is None:
+        fail("no run found; start one with bin/agent --profile api")
+    manifest_path = run / "manifest.json"
+    if not manifest_path.exists():
+        fail(f"manifest not found: {manifest_path}")
+    import json
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("egress_mode") != "broker":
+        fail("the latest run does not use the egress broker")
+    workspace_override = Path(
+        manifest.get("workspace_override", run / "compose.workspace.yaml")
+    )
+    if not workspace_override.exists():
+        fail(f"workspace override is missing: {workspace_override}")
+
+    files = compose_files("broker")
+    files.append(workspace_override)
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPOSE_PROJECT_NAME": cfg.get("COMPOSE_PROJECT_NAME", "agent-paladin"),
+            "AGENT_UID": str(os.getuid()),
+            "AGENT_GID": str(os.getgid()),
+            "SANDBOX_HOME_DIR": manifest.get("home", ""),
+            "SANDBOX_WORKSPACE_MODE": manifest.get("workspace_mode", "snapshot"),
+            "SANDBOX_EGRESS_MODE": "broker",
+        }
+    )
+    command = compose_command(files, project_name=cfg.get("COMPOSE_PROJECT_NAME"))
+    command.extend(["exec", "-T", "egress-broker", "python", "/app/admin.py"])
+    command.extend(argv[1:] if len(argv) > 1 else ["list"])
+    return subprocess.run(command, env=env, check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

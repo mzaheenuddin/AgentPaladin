@@ -1,0 +1,5 @@
+# Domains the local Ollama runtime may reach to download models.
+# Keep this separate from the provider allowlist so LiteLLM cannot reach the
+# model registry and Ollama cannot reach provider APIs.
+.ollama.ai
+.ollama.com

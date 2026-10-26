@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Build all local images without starting a sandbox run."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from common import compose_command, config, ensure_dir  # noqa: E402
+
+
+def main() -> int:
+    cfg = config()
+    files = [
+        ROOT / "compose.yaml",
+        ROOT / "compose.egress.allowlist.yaml",
+        ROOT / "compose.egress.broker.yaml",
+    ]
+    home = ensure_dir(Path(cfg["STATE_DIR"]) / "build-home", 0o700)
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPOSE_PROJECT_NAME": cfg.get("COMPOSE_PROJECT_NAME", "agent-paladin"),
+            "AGENT_UID": str(os.getuid()),
+            "AGENT_GID": str(os.getgid()),
+            "SANDBOX_HOME_DIR": str(home),
+            "SANDBOX_WORKSPACE_MODE": "snapshot",
+            "SANDBOX_EGRESS_MODE": "deny",
+        }
+    )
+    command = compose_command(files, project_name=cfg.get("COMPOSE_PROJECT_NAME"))
+    command.extend(
+        [
+            "build",
+            "sandbox",
+            "llm-gateway",
+            "prompt-dlp",
+            "llm-proxy",
+            "llm-egress",
+            "sandbox-egress",
+            "egress-broker",
+            "sandbox-firewall",
+        ]
+    )
+    print("building images...")
+    return subprocess.run(command, env=env, check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

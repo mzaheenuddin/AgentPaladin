@@ -1,0 +1,58 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  egress-broker:
+    build:
+      context: .
+      dockerfile: docker/egress-broker/Dockerfile
+    image: agent-paladin/egress-broker:1
+    user: "10002:10002"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=32m
+    environment:
+      # Listen only on the sandbox-facing address. The broker also has a
+      # public_net interface for upstream calls, but it must not expose its
+      # unauthenticated /request endpoint there.
+      LISTEN_HOST: 172.31.240.5
+      LISTEN_PORT: "24443"
+      ADMIN_HOST: 127.0.0.1
+      ADMIN_PORT: "24900"
+    secrets:
+      - github_token
+    volumes:
+      - ./config/broker/config.json:/etc/broker/config.json:ro
+    networks:
+      sandbox_net:
+        ipv4_address: 172.31.240.5
+      public_net: {}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://172.31.240.5:24443/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+    mem_limit: 512m
+    cpus: 2
+    pids_limit: 256
+    logging: *default-logging
+
+  sandbox:
+    environment:
+      SANDBOX_EGRESS_MODE: broker
+      EGRESS_BROKER_URL: http://egress-broker:24443
+    depends_on:
+      egress-broker:
+        condition: service_healthy
+
+  sandbox-firewall:
+    environment:
+      BROKER_ENABLED: "1"

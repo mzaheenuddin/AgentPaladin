@@ -1,0 +1,18 @@
+[core]
+	hooksPath = /etc/git/empty-hooks
+	fsmonitor = false
+	pager = cat
+	editor = true
+	sshCommand = /bin/false
+[credential]
+	helper =
+[protocol "ext"]
+	allow = never
+[transfer]
+	fsckObjects = true
+[fetch]
+	fsckObjects = true
+[receive]
+	fsckObjects = true
+[safe]
+	directory = /workspace

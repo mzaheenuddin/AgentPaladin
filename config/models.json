@@ -1,0 +1,123 @@
+{
+  "default": "deepseek-v4-flash",
+  "models": [
+    {
+      "alias": "deepseek-v4-flash",
+      "provider": "deepseek",
+      "upstream": "deepseek/deepseek-v4-flash",
+      "secret": "DEEPSEEK_API_KEY",
+      "apiBase": null,
+      "limit": {
+        "context": 1048576,
+        "output": 393216
+      },
+      "capabilities": {
+        "tools": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "cacheFormat": null,
+      "localOnly": false,
+      "name": "DeepSeek V4 Flash"
+    },
+    {
+      "alias": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "upstream": "deepseek/deepseek-v4-pro",
+      "secret": "DEEPSEEK_API_KEY",
+      "apiBase": null,
+      "limit": {
+        "context": 1048576,
+        "output": 393216
+      },
+      "capabilities": {
+        "tools": true,
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "cacheFormat": null,
+      "localOnly": false,
+      "name": "DeepSeek V4 Pro"
+    },
+    {
+      "alias": "claude-sonnet-5-5",
+      "provider": "anthropic",
+      "upstream": "anthropic/claude-sonnet-5-5",
+      "secret": "ANTHROPIC_API_KEY",
+      "apiBase": null,
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      },
+      "capabilities": {
+        "tools": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "cacheFormat": "anthropic",
+      "localOnly": false,
+      "name": "Claude Sonnet 5.5"
+    },
+    {
+      "alias": "gpt-6.1-sol",
+      "provider": "openai",
+      "upstream": "openai/gpt-6.1-sol",
+      "secret": "OPENAI_API_KEY",
+      "apiBase": null,
+      "limit": {
+        "context": 1050000,
+        "output": 128000
+      },
+      "capabilities": {
+        "tools": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "cacheFormat": null,
+      "localOnly": false,
+      "name": "GPT-6.1 Sol"
+    },
+    {
+      "alias": "local-qwen3-coder",
+      "provider": "ollama",
+      "upstream": "ollama/qwen3-coder",
+      "secret": null,
+      "apiBase": "http://ollama:11434",
+      "limit": {
+        "context": 131072,
+        "output": 32768
+      },
+      "capabilities": {
+        "tools": true,
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "cacheFormat": null,
+      "localOnly": true,
+      "name": "Qwen3 Coder (local)"
+    }
+  ]
+}

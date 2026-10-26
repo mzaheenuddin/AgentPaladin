@@ -1,0 +1,7 @@
+# Domains the LLM proxy may reach. One domain per line.
+# Squid dstdomain ACLs. A leading dot covers subdomains; do not list both
+# a domain and its subdomains, because Squid treats that as a configuration error.
+.deepseek.com
+.anthropic.com
+.openai.com
+.openrouter.ai

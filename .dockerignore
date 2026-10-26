@@ -1,0 +1,12 @@
+.agent
+.git
+docs
+secrets
+tests
+prompt.md
+.env
+config/agent.env
+*.log
+.DS_Store
+__pycache__
+*.pyc

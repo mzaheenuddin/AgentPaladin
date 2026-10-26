@@ -1,0 +1,6 @@
+# Provider API domains the sandbox must never reach directly.
+# The sandbox is supposed to use the authenticated LLM gateway instead.
+.deepseek.com
+.anthropic.com
+.openai.com
+.openrouter.ai
